@@ -103,14 +103,12 @@ public class DemoClient : BackgroundService
         var account = e.Account;
         var positions = e.UpdatedPositions;
         var orders = e.UpdatedOrders;
-        var trades = e.UpdatedTrades;
 
         _logger.LogInformation(
-            "Account Update: AccountId={AccountId}, Positions={PositionCount}, Orders={OrderCount}, Trades={TradeCount}",
+            "Account Update: AccountId={AccountId}, Positions={PositionCount}, Orders={OrderCount}",
             account.Details.AccountId,
             positions.Count,
-            orders.Count,
-            trades.Count);
+            orders.Count);
 
         foreach (var position in positions)
         {
@@ -121,110 +119,81 @@ public class DemoClient : BackgroundService
                 position.Data.AverageOpenPrice?.ToStringValue() ?? "N/A");
         }
 
+        if (!_isSnapshotProcessed && orders.Count > 50)
+        {
+            _logger.LogInformation("Processing initial snapshot, inserting Finished orders.");
+            foreach (var order in orders.Where(o => o.Data.Status == OrderStatus.Finished))
+            {
+                _logger.LogInformation("Order StatusDetail: {StatusDetail}", order.Data.StatusDetail ?? "null");
+                _logger.LogInformation(
+                    "Order: ID={UniqueId}, Market={MarketId}, Status={Status}, BuySell={BuySell}, Qty={CurrentVolume}, Price={CurrentPrice}, TotalFillVolume={TotalFillVolume}, StatusDetail={StatusDetail}, Change={Change}",
+                    order.Data.UniqueId,
+                    order.Data.MarketId,
+                    order.Data.Status,
+                    order.Data.BuySell,
+                    order.Data.CurrentVolume,
+                    order.Data.CurrentLimitPrice?.ToStringValue() ?? "Market",
+                    order.Data.TotalFillVolume,
+                    order.Data.StatusDetail ?? "null",
+                    order.Data.Change.ToString());
+
+                try
+                {
+                    _dbHelper.InsertOrUpdateOrder(
+                        order.Data.UniqueId,
+                        order.Data.MarketId,
+                        order.Data.Status.ToString(),
+                        order.Data.BuySell.ToString(),
+                        order.Data.CurrentVolume,
+                        order.Data.CurrentLimitPrice?.ToDecimal(),
+                        order.Data.TotalFillVolume,
+                        order.Data.Time?.ProtobufTimestampToCST() ?? DateTime.Now,
+                        order.Data.StatusDetail ?? string.Empty,
+                        order.Data.Change.ToString());
+                    _logger.LogInformation("Inserted/Updated order: OrderUniqueId={OrderUniqueId}, Status={Status}", order.Data.UniqueId, order.Data.Status);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to insert/update order: OrderUniqueId={OrderUniqueId}", order.Data.UniqueId);
+                }
+            }
+            _isSnapshotProcessed = true;
+            return;
+        }
+
         foreach (var order in orders)
         {
+            _logger.LogInformation("Order StatusDetail: {StatusDetail}", order.Data.StatusDetail ?? "null");
             _logger.LogInformation(
-                "Order: ID={UniqueId}, Market={MarketId}, Status={Status}, BuySell={BuySell}, Qty={CurrentVolume}, Price={CurrentPrice}, TotalFillVolume={TotalFillVolume}",
+                "Order: ID={UniqueId}, Market={MarketId}, Status={Status}, BuySell={BuySell}, Qty={CurrentVolume}, Price={CurrentPrice}, TotalFillVolume={TotalFillVolume}, StatusDetail={StatusDetail}, Change={Change}",
                 order.Data.UniqueId,
                 order.Data.MarketId,
                 order.Data.Status,
                 order.Data.BuySell,
                 order.Data.CurrentVolume,
                 order.Data.CurrentLimitPrice?.ToStringValue() ?? "Market",
-                order.Data.TotalFillVolume);
-        }
+                order.Data.TotalFillVolume,
+                order.Data.StatusDetail ?? "null",
+                order.Data.Change.ToString());
 
-        if (!_isSnapshotProcessed && orders.Count > 50)
-        {
-            _logger.LogInformation("Processing initial snapshot, inserting all trade events.");
-            foreach (var order in orders)
+            try
             {
-                foreach (var trade in order.Data.Trades)
-                {
-                    if (trade.Price != null && trade.Time != null)
-                    {
-                        try
-                        {
-                            _dbHelper.InsertTrade(
-                                order.Data.UniqueId,
-                                order.Data.MarketId,
-                                trade.Price.ToDecimal() ?? 0.0m,
-                                trade.Volume,
-                                order.Data.BuySell.ToString(),
-                                order.Data.Status.ToString(),
-                                trade.Time.ProtobufTimestampToCST(),
-                                trade.SequenceOrder
-                            );
-                            _logger.LogInformation("Inserted snapshot trade: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", order.Data.UniqueId, trade.SequenceOrder);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Failed to insert snapshot trade: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", order.Data.UniqueId, trade.SequenceOrder);
-                        }
-                    }
-                }
+                _dbHelper.InsertOrUpdateOrder(
+                    order.Data.UniqueId,
+                    order.Data.MarketId,
+                    order.Data.Status.ToString(),
+                    order.Data.BuySell.ToString(),
+                    order.Data.CurrentVolume,
+                    order.Data.CurrentLimitPrice?.ToDecimal(),
+                    order.Data.TotalFillVolume,
+                    order.Data.Time?.ProtobufTimestampToCST() ?? DateTime.Now,
+                    order.Data.StatusDetail ?? string.Empty,
+                    order.Data.Change.ToString());
+                _logger.LogInformation("Inserted/Updated order: OrderUniqueId={OrderUniqueId}, Status={Status}", order.Data.UniqueId, order.Data.Status);
             }
-            foreach (var trade in trades)
+            catch (Exception ex)
             {
-                var priceString = trade.Data.Price != null ? trade.Data.Price.ToStringValue() : "N/A";
-                var timestampString = trade.Data.Time != null ? trade.Data.Time.ProtobufTimestampToCST().ToString("o") : "N/A";
-                _logger.LogInformation(
-                    "Snapshot Trade: OrderUniqueId={OrderUniqueId}, TradeVolume={TradeVolume}, TotalFillVolume={TotalFillVolume}, BuySell={BuySell}, Status={Status}, Price={Price}, Market={MarketId}, Time={Timestamp}, SequenceOrder={SequenceOrder}",
-                    trade.Order.Data.UniqueId,
-                    trade.Data.Volume,
-                    trade.Order.Data.TotalFillVolume,
-                    trade.Order.Data.BuySell,
-                    trade.Order.Data.Status,
-                    priceString,
-                    trade.Order.MarketId,
-                    timestampString,
-                    trade.Data.SequenceOrder);
-            }
-            _isSnapshotProcessed = true;
-            return;
-        }
-
-        foreach (var trade in trades)
-        {
-            var priceString = trade.Data.Price != null ? trade.Data.Price.ToStringValue() : "N/A";
-            var timestampString = trade.Data.Time != null ? trade.Data.Time.ProtobufTimestampToCST().ToString("o") : "N/A";
-
-            _logger.LogInformation(
-                "Trade: OrderUniqueId={OrderUniqueId}, TradeVolume={TradeVolume}, TotalFillVolume={TotalFillVolume}, BuySell={BuySell}, Status={Status}, Price={Price}, Market={MarketId}, Time={Timestamp}, SequenceOrder={SequenceOrder}",
-                trade.Order.Data.UniqueId,
-                trade.Data.Volume,
-                trade.Order.Data.TotalFillVolume,
-                trade.Order.Data.BuySell,
-                trade.Order.Data.Status,
-                priceString,
-                trade.Order.MarketId,
-                timestampString,
-                trade.Data.SequenceOrder);
-
-            if (trade.Data.Price != null && trade.Data.Time != null)
-            {
-                try
-                {
-                    _dbHelper.InsertTrade(
-                        trade.Order.Data.UniqueId,
-                        trade.Order.MarketId,
-                        trade.Data.Price.ToDecimal() ?? 0.0m,
-                        trade.Data.Volume,
-                        trade.Order.Data.BuySell.ToString(),
-                        trade.Order.Data.Status.ToString(),
-                        trade.Data.Time.ProtobufTimestampToCST(),
-                        trade.Data.SequenceOrder
-                    );
-                    _logger.LogInformation("Successfully inserted trade into database: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", trade.Order.Data.UniqueId, trade.Data.SequenceOrder);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Failed to insert trade into database: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", trade.Order.Data.UniqueId, trade.Data.SequenceOrder);
-                }
-            }
-            else
-            {
-                _logger.LogWarning("Skipped trade insertion due to missing Price or Time: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", trade.Order.Data.UniqueId, trade.Data.SequenceOrder);
+                _logger.LogError(ex, "Failed to insert/update order: OrderUniqueId={OrderUniqueId}", order.Data.UniqueId);
             }
         }
 
