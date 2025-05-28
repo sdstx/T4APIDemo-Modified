@@ -3,6 +3,12 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using T4APIDemo.T4;
 using T4APIDemo.T4.Util;
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Collections.Generic;
+using System.Linq;
+using T4Proto.V1.Common;
 
 namespace T4APIDemo.DemoClient;
 
@@ -11,26 +17,29 @@ public class DemoClient : BackgroundService
     private readonly ILogger<DemoClient> _logger;
     private readonly T4APIClient _apiClient;
     private readonly IConfiguration _configuration;
+    private readonly DatabaseHelper _dbHelper;
+    private readonly CancellationTokenSource _shutdownCts = new CancellationTokenSource();
+    private bool _isSnapshotProcessed;
 
-    public DemoClient(ILogger<DemoClient> logger, T4APIClient apiClient, IConfiguration configuration)
+    public DemoClient(ILogger<DemoClient> logger, T4APIClient apiClient, IConfiguration configuration, DatabaseHelper dbHelper)
     {
         _logger = logger;
         _apiClient = apiClient;
         _configuration = configuration;
+        _dbHelper = dbHelper;
+        _isSnapshotProcessed = false;
 
         _apiClient.OnConnectionStatusChanged += _apiClient_OnConnectionStatusChanged;
         _apiClient.OnAccountUpdate += _apiClient_OnAccountUpdate;
-        _apiClient.OnMarketUpdate += _apiClient_OnMarketUpdate;
     }
 
     public override void Dispose()
     {
-        // Unsubscribe from events to prevent memory leaks
         _apiClient.OnConnectionStatusChanged -= _apiClient_OnConnectionStatusChanged;
         _apiClient.OnAccountUpdate -= _apiClient_OnAccountUpdate;
-        _apiClient.OnMarketUpdate -= _apiClient_OnMarketUpdate;
-
+        _shutdownCts.Dispose();
         _logger.LogInformation("DemoClient resources released");
+        base.Dispose();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -39,33 +48,21 @@ public class DemoClient : BackgroundService
 
         try
         {
-            // Start the API client
-            await _apiClient.StartAsync();
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, _shutdownCts.Token);
 
-            // Subscribe to all user accounts
+            await _apiClient.StartAsync();
             await _apiClient.SubscribeAllAccounts();
 
-            //// Example: Subscribe to some markets
-            //var markets = new (string, string, string)[]
-            //{
-            //    ("CME_C", "ZC", "XCME_C ZC (K25)"),
-            //    ("CME_C", "ZS", "XCME_C ZS (K25)"),
-            //    ("CME_Eq", "ES", "XCME_Eq ES (M25)"),
-            //    ("CME_Eq", "NQ", "XCME_Eq NQ (M25)")
-            //};
+            _logger.LogInformation("Subscribed to all accounts, waiting for updates...");
 
-            //foreach (var market in markets)
-            //{
-            //    _logger.LogInformation($"Subscribing to market: {market.Item3}");
-            //    await _apiClient.SubscribeMarket(market.Item1, market.Item2, market.Item3);
-            //    _logger.LogInformation($"Subscribed market: {market.Item3}");
-            //}
-
-            // Keep the service running until cancellation is requested
-            while (!stoppingToken.IsCancellationRequested)
+            while (!linkedCts.Token.IsCancellationRequested)
             {
-                await Task.Delay(5000, stoppingToken);
+                await Task.Delay(5000, linkedCts.Token);
             }
+        }
+        catch (TaskCanceledException)
+        {
+            _logger.LogInformation("DemoClient execution canceled.");
         }
         catch (Exception ex)
         {
@@ -74,17 +71,31 @@ public class DemoClient : BackgroundService
         finally
         {
             _logger.LogInformation("DemoClient shutting down...");
+            try
+            {
+                _apiClient.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error disposing T4APIClient during shutdown");
+            }
         }
     }
 
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("StopAsync called, initiating shutdown...");
+        _shutdownCts.Cancel();
+        await base.StopAsync(cancellationToken);
+    }
 
     private void _apiClient_OnConnectionStatusChanged(object? sender, ConnectionStatusEventArgs e)
     {
         _logger.LogInformation(
-                    "Connection status changed: Connected={IsConnected}, Uptime={Uptime}, Disconnections={DisconnectionCount}",
-                    e.IsConnected,
-                    e.Uptime.ToString(@"hh\:mm\:ss"),
-                    e.DisconnectionCount);
+            "Connection status changed: Connected={IsConnected}, Uptime={Uptime}, Disconnections={DisconnectionCount}",
+            e.IsConnected,
+            e.Uptime.ToString(@"hh\:mm\:ss"),
+            e.DisconnectionCount);
     }
 
     private void _apiClient_OnAccountUpdate(object? sender, T4.AccountData.AccountUpdateEventArgs e)
@@ -94,106 +105,133 @@ public class DemoClient : BackgroundService
         var orders = e.UpdatedOrders;
         var trades = e.UpdatedTrades;
 
-        //_logger.LogInformation(
-        //    "Account update: AccountId={AccountId}, Positions={PositionCount}, Orders={OrderCount}, Trades={TradeCount}",
-        //    account.Details.AccountId,
-        //    positions.Count,
-        //    orders.Count,
-        //    trades.Count);
+        _logger.LogInformation(
+            "Account Update: AccountId={AccountId}, Positions={PositionCount}, Orders={OrderCount}, Trades={TradeCount}",
+            account.Details.AccountId,
+            positions.Count,
+            orders.Count,
+            trades.Count);
 
-        //// Log individual positions if any were updated
-        //foreach (var position in positions)
-        //{
-        //    var posData = position.Data;
-        //    _logger.LogInformation(
-        //        "Position: Market={MarketId}, NetQty={NetQty}, AvgPrice={AvgPrice}",
-        //        posData.MarketId,
-        //        posData.Buys - posData.Sells,
-        //        posData.AverageOpenPrice?.ToStringValue() ?? "N/A");
-        //}
+        foreach (var position in positions)
+        {
+            _logger.LogInformation(
+                "Position: Market={MarketId}, NetQty={NetQty}, AvgPrice={AvgPrice}",
+                position.Data.MarketId,
+                position.Data.Buys - position.Data.Sells,
+                position.Data.AverageOpenPrice?.ToStringValue() ?? "N/A");
+        }
 
-        //// Log individual orders if any were updated
-        //foreach (var order in orders)
-        //{
-        //    var orderData = order.Data;
-        //    _logger.LogInformation(
-        //        "Order: ID={UniqueId}, Market={MarketId}, Status={Status}, BuySell={BuySell}, Qty={CurrentVolume}, Price={CurrentPrice}",
-        //        orderData.UniqueId,
-        //        orderData.MarketId,
-        //        orderData.Status,
-        //        orderData.BuySell,
-        //        orderData.CurrentVolume,
-        //        orderData.CurrentLimitPrice?.ToStringValue() ?? "Market");
-        //}
+        foreach (var order in orders)
+        {
+            _logger.LogInformation(
+                "Order: ID={UniqueId}, Market={MarketId}, Status={Status}, BuySell={BuySell}, Qty={CurrentVolume}, Price={CurrentPrice}, TotalFillVolume={TotalFillVolume}",
+                order.Data.UniqueId,
+                order.Data.MarketId,
+                order.Data.Status,
+                order.Data.BuySell,
+                order.Data.CurrentVolume,
+                order.Data.CurrentLimitPrice?.ToStringValue() ?? "Market",
+                order.Data.TotalFillVolume);
+        }
 
-        // Log individual trades if any were updated
+        if (!_isSnapshotProcessed && orders.Count > 50)
+        {
+            _logger.LogInformation("Processing initial snapshot, inserting all trade events.");
+            foreach (var order in orders)
+            {
+                foreach (var trade in order.Data.Trades)
+                {
+                    if (trade.Price != null && trade.Time != null)
+                    {
+                        try
+                        {
+                            _dbHelper.InsertTrade(
+                                order.Data.UniqueId,
+                                order.Data.MarketId,
+                                trade.Price.ToDecimal() ?? 0.0m,
+                                trade.Volume,
+                                order.Data.BuySell.ToString(),
+                                order.Data.Status.ToString(),
+                                trade.Time.ProtobufTimestampToCST(),
+                                trade.SequenceOrder
+                            );
+                            _logger.LogInformation("Inserted snapshot trade: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", order.Data.UniqueId, trade.SequenceOrder);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Failed to insert snapshot trade: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", order.Data.UniqueId, trade.SequenceOrder);
+                        }
+                    }
+                }
+            }
+            foreach (var trade in trades)
+            {
+                var priceString = trade.Data.Price != null ? trade.Data.Price.ToStringValue() : "N/A";
+                var timestampString = trade.Data.Time != null ? trade.Data.Time.ProtobufTimestampToCST().ToString("o") : "N/A";
+                _logger.LogInformation(
+                    "Snapshot Trade: OrderUniqueId={OrderUniqueId}, TradeVolume={TradeVolume}, TotalFillVolume={TotalFillVolume}, BuySell={BuySell}, Status={Status}, Price={Price}, Market={MarketId}, Time={Timestamp}, SequenceOrder={SequenceOrder}",
+                    trade.Order.Data.UniqueId,
+                    trade.Data.Volume,
+                    trade.Order.Data.TotalFillVolume,
+                    trade.Order.Data.BuySell,
+                    trade.Order.Data.Status,
+                    priceString,
+                    trade.Order.MarketId,
+                    timestampString,
+                    trade.Data.SequenceOrder);
+            }
+            _isSnapshotProcessed = true;
+            return;
+        }
+
         foreach (var trade in trades)
         {
+            var priceString = trade.Data.Price != null ? trade.Data.Price.ToStringValue() : "N/A";
+            var timestampString = trade.Data.Time != null ? trade.Data.Time.ProtobufTimestampToCST().ToString("o") : "N/A";
+
             _logger.LogInformation(
-                "Trade: ID={ExchangeTradeId}, Volume={Volume}, Price={Price}",
-                trade.ExchangeTradeId,
+                "Trade: OrderUniqueId={OrderUniqueId}, TradeVolume={TradeVolume}, TotalFillVolume={TotalFillVolume}, BuySell={BuySell}, Status={Status}, Price={Price}, Market={MarketId}, Time={Timestamp}, SequenceOrder={SequenceOrder}",
+                trade.Order.Data.UniqueId,
                 trade.Data.Volume,
-                trade.Data.Price.ToStringValue());
-        }
-    }
+                trade.Order.Data.TotalFillVolume,
+                trade.Order.Data.BuySell,
+                trade.Order.Data.Status,
+                priceString,
+                trade.Order.MarketId,
+                timestampString,
+                trade.Data.SequenceOrder);
 
-    private void _apiClient_OnMarketUpdate(T4.MarketData.MarketDataSnapshot snapshot)
-    {
-        string marketId = snapshot.MarketID ?? "Unknown";
-
-        // Log market depth updates
-        if (snapshot.MarketDepth != null)
-        {
-            var depth = snapshot.MarketDepth;
-            int bidLevels = depth.Bids.Count;
-            int offerLevels = depth.Offers.Count;
-
-            var bestBid = bidLevels > 0 ? depth.Bids[0] : null;
-            var bestOffer = offerLevels > 0 ? depth.Offers[0] : null;
-
-            string bestBidStr = bestBid != null ? $"{bestBid.Volume}@{bestBid.Price.ToStringValue()}" : "None";
-            string bestOfferStr = bestOffer != null ? $"{bestOffer.Volume}@{bestOffer.Price.ToStringValue()}" : "None";
-
-            _logger.LogInformation(
-                "Market depth update: Market={MarketId}, Mode={Mode}, BestBid={BestBid}, BestOffer={BestOffer}",
-                marketId,
-                depth.Mode,
-                bestBidStr,
-                bestOfferStr);
-        }
-
-        // Log market by order updates
-        if (snapshot.MarketByOrder != null)
-        {
-            var mbo = snapshot.MarketByOrder;
-            _logger.LogInformation(
-                "Market by order update: Market={MarketId}, Mode={Mode}, OrderCount={OrderCount}, BidLevels={BidLevels}, OfferLevels={OfferLevels}",
-                marketId,
-                mbo.MarketMode,
-                mbo.OrderCount,
-                mbo.Bids.Count,
-                mbo.Offers.Count);
+            if (trade.Data.Price != null && trade.Data.Time != null)
+            {
+                try
+                {
+                    _dbHelper.InsertTrade(
+                        trade.Order.Data.UniqueId,
+                        trade.Order.MarketId,
+                        trade.Data.Price.ToDecimal() ?? 0.0m,
+                        trade.Data.Volume,
+                        trade.Order.Data.BuySell.ToString(),
+                        trade.Order.Data.Status.ToString(),
+                        trade.Data.Time.ProtobufTimestampToCST(),
+                        trade.Data.SequenceOrder
+                    );
+                    _logger.LogInformation("Successfully inserted trade into database: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", trade.Order.Data.UniqueId, trade.Data.SequenceOrder);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to insert trade into database: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", trade.Order.Data.UniqueId, trade.Data.SequenceOrder);
+                }
+            }
+            else
+            {
+                _logger.LogWarning("Skipped trade insertion due to missing Price or Time: OrderUniqueId={OrderUniqueId}, SequenceOrder={SequenceOrder}", trade.Order.Data.UniqueId, trade.Data.SequenceOrder);
+            }
         }
 
-        // Log settlement updates
-        if (snapshot.MarketSettlement != null)
+        if (!_isSnapshotProcessed)
         {
-            var settlement = snapshot.MarketSettlement;
-            _logger.LogInformation(
-                "Market settlement update: Market={MarketId}, SettlementPrice={SettlementPrice}",
-                marketId,
-                settlement.SettlementPrice?.ToStringValue() ?? "N/A");
-        }
-
-        // Log high/low updates
-        if (snapshot.MarketHighLow != null)
-        {
-            var highLow = snapshot.MarketHighLow;
-            _logger.LogInformation(
-                "Market high/low update: Market={MarketId}, High={High}, Low={Low}",
-                marketId,
-                highLow.HighPrice?.ToStringValue() ?? "N/A",
-                highLow.LowPrice?.ToStringValue() ?? "N/A");
+            _isSnapshotProcessed = true;
         }
     }
 }
+
