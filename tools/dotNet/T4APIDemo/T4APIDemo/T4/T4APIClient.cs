@@ -116,23 +116,28 @@ public class T4APIClient : IDisposable
             );
     }
 
-    public void Dispose()
+    public async void Dispose()
+{
+    _logger.LogInformation("Disposing T4APIClient");
+    _isDisposed = true;
+    _reconnectionLock.Dispose();
+    _heartbeatTimer.Dispose();
+
+    if (_client.State == WebSocketState.Open)
     {
-        _logger.LogInformation("Disposing T4APIClient");
-        _isDisposed = true;
-        _reconnectionLock.Dispose();
-        _heartbeatTimer.Dispose();
-
-        if (_client.State == WebSocketState.Open)
+        try
         {
-            _client.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing", CancellationToken.None)
-                  .GetAwaiter()
-                  .GetResult();
+            await _client.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing", CancellationToken.None);
         }
-
-        _client.Dispose();
-        _logger.LogInformation("T4APIClient disposed");
+        catch (WebSocketException ex)
+        {
+            _logger.LogWarning(ex, "Failed to close WebSocket gracefully during disposal");
+        }
     }
+
+    _client.Dispose();
+    _logger.LogInformation("T4APIClient disposed");
+}
 
     public async Task StartAsync()
     {
@@ -147,27 +152,22 @@ public class T4APIClient : IDisposable
     }
 
     public async Task<HttpClient> GetHttpClientAsync()
+{
+    var client = _httpClientFactory.CreateClient("T4API");
+    if (_loginResponse != null)
     {
-        // Get a new client from the factory
-        var client = _httpClientFactory.CreateClient("T4API");
-
-        if (_loginResponse != null)
+        var token = await GetAuthToken();
+        if (token != null && !string.IsNullOrEmpty(token.Token)) // Check for non-null token
         {
-            // Use auth token if available, refreshing if needed
-            var token = await GetAuthToken();
-
-            if (token != null && token.HasToken)
-            {
-                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
-            }
-            else
-            {
-                _logger.LogError("Failed to get auth token for HttpClient");
-            }
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
         }
-
-        return client;
+        else
+        {
+            _logger.LogError("Failed to get auth token for HttpClient");
+        }
     }
+    return client;
+}
 
     public async Task<AuthenticationToken?> GetAuthToken()
     {
@@ -348,49 +348,52 @@ public class T4APIClient : IDisposable
     }
 
     private async Task RunReceiveLoopAsync()
+{
+    bool wasConnected = false;
+    while (!_isDisposed)
     {
-        bool wasConnected = false;
-
-        while (!_isDisposed)
+        try
         {
-            try
+            var isConnected = IsConnectionHealthy();
+
+            if (wasConnected && !isConnected)
             {
-                var isConnected = IsConnectionHealthy();
-
-                // Handle connection state changes
-                if (wasConnected && !isConnected)
-                {
-                    _disconnectionCount++;
-                    _logger.LogWarning("Connection lost. Total disconnections: {Count}", _disconnectionCount);
-                    PublishConnectionStatus(isConnected);
-                }
-                else if (!wasConnected && isConnected)
-                {
-                    _logger.LogInformation("Connection restored");
-                    PublishConnectionStatus(isConnected);
-                }
-
-                wasConnected = isConnected;
-
-                if (!isConnected)
-                {
-                    await ConnectAsync();
-                    await ResubscribeMarketsAsync();
-                    await Task.Delay(1000); // Prevent tight loop on connection attempts
-                    continue;
-                }
-
-                // Process messages when connected
-                var serverMessage = await ReceiveMessageAsync();
-                ProcessServerMessage(serverMessage);
+                _disconnectionCount++;
+                _logger.LogWarning("Connection lost. Total disconnections: {Count}", _disconnectionCount);
+                PublishConnectionStatus(false);
             }
-            catch (Exception ex) when (!_isDisposed)
+            else if (!wasConnected && isConnected)
             {
-                _logger.LogError(ex, "Error in receive/monitor loop");
-                await Task.Delay(1000); // Prevent tight loop on errors
+                _logger.LogInformation("Connection restored");
+                await ResubscribeMarketsAsync();
+                await SubscribeAllAccounts(); // Resubscribe accounts
+                PublishConnectionStatus(true);
             }
+
+            wasConnected = isConnected;
+
+            if (!isConnected)
+            {
+                _logger.LogInformation("Attempting reconnection, attempt {Count}", _disconnectionCount + 1);
+                await ConnectAsync();
+                continue;
+            }
+
+            var serverMessage = await ReceiveMessageAsync();
+            if (serverMessage == null)
+            {
+                _logger.LogWarning("Null message received, triggering reconnection");
+                continue; // Reconnect
+            }
+            ProcessServerMessage(serverMessage);
+        }
+        catch (Exception ex) when (!_isDisposed)
+        {
+            _logger.LogError(ex, "Error in receive/monitor loop");
+            await Task.Delay(1000); // Prevent tight loop
         }
     }
+}
 
     #endregion
 
@@ -523,31 +526,45 @@ public class T4APIClient : IDisposable
 
     #region Message Handling
 
-    private async Task<T4Proto.V1.Service.ServerMessage> ReceiveMessageAsync()
+    private async Task<T4Proto.V1.Service.ServerMessage?> ReceiveMessageAsync()
+{
+    try
     {
         using var messageStream = new MemoryStream();
         var buffer = new byte[4096];
 
-        while (true)
+        while (!_isDisposed)
         {
             var result = await _client.ReceiveAsync(buffer, CancellationToken.None);
 
             if (result.MessageType == WebSocketMessageType.Close)
             {
-                throw new Exception("Server closed connection");
+                _logger.LogWarning("Server closed connection: Status={Status}, Description={Description}", 
+                    result.CloseStatus, result.CloseStatusDescription);
+                return null; // Signal reconnection
             }
 
-            // Write this chunk to our accumulating stream
             await messageStream.WriteAsync(buffer.AsMemory(0, result.Count));
 
-            // If this is the end of the message, we can process it
             if (result.EndOfMessage)
             {
                 var completeMessage = messageStream.ToArray();
                 return T4Proto.V1.Service.ServerMessage.Parser.ParseFrom(completeMessage);
             }
         }
+        return null; // Disposed
     }
+    catch (WebSocketException ex)
+    {
+        _logger.LogWarning(ex, "WebSocket error in ReceiveMessageAsync: {Message}", ex.Message);
+        return null; // Trigger reconnection
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Unexpected error in ReceiveMessageAsync");
+        throw; // Rethrow non-WebSocket errors
+    }
+}
 
     public async Task SendMessageAsync(IMessage message, ClientWebSocket? client = null)
     {
@@ -862,23 +879,24 @@ public class T4APIClient : IDisposable
     }
 
     private bool IsConnectionHealthy()
+{
+    _logger.LogDebug("Checking WebSocket state: {State}", _client.State);
+    if (_client.State != WebSocketState.Open)
     {
-        if (_client.State != WebSocketState.Open)
-        {
-            _logger.LogWarning("Connection unhealthy: WebSocket state is {State}", _client.State);
-            return false;
-        }
-
-        var timeSinceLastMessage = DateTime.UtcNow - _lastMessageReceived;
-        var isHealthy = timeSinceLastMessage.TotalSeconds <= MessageTimeoutSeconds;
-
-        if (!isHealthy)
-        {
-            _logger.LogWarning("Connection unhealthy: No messages received for {Seconds} seconds", timeSinceLastMessage.TotalSeconds);
-        }
-
-        return isHealthy;
+        _logger.LogWarning("Connection unhealthy: WebSocket state is {State}", _client.State);
+        return false;
     }
+
+    var timeSinceLastMessage = DateTime.UtcNow - _lastMessageReceived;
+    var isHealthy = timeSinceLastMessage.TotalSeconds <= MessageTimeoutSeconds;
+
+    if (!isHealthy)
+    {
+        _logger.LogWarning("Connection unhealthy: No messages received for {Seconds} seconds", timeSinceLastMessage.TotalSeconds);
+    }
+
+    return isHealthy;
+}
 
     #endregion
 

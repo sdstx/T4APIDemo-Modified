@@ -17,11 +17,9 @@ builder.ConfigureServices((hostContext, services) =>
     });
     services.AddSingleton<T4APIClient>();
     services.AddSingleton<DatabaseHelper>(sp => 
-        new DatabaseHelper("trades.db", sp.GetRequiredService<ILoggerFactory>()));
+        new DatabaseHelper("trades.db", sp.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseHelper>()));
     services.AddHostedService<DemoClient>();
 });
 
 var host = builder.Build();
 await host.RunAsync();
-
-
