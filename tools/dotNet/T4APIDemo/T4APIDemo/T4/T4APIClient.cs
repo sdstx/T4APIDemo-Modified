@@ -16,6 +16,7 @@ using T4Proto.V1.Account;
 using T4Proto.V1.Auth;
 using T4Proto.V1.Common;
 using T4Proto.V1.Market;
+using T4Proto.V1.Orderrouting;
 using T4Proto.V1.Service;
 
 namespace T4APIDemo.T4;
@@ -24,22 +25,12 @@ public class T4APIClient : IDisposable
 {
     #region Events
 
-    /// <summary>
-    /// Event raised when an account is loaded and ready.
-    /// </summary>
     public event EventHandler<AccountUpdateEventArgs>? OnAccountUpdate;
-
-    /// <summary>
-    /// Event raised on new real-time market data.
-    /// </summary>
     public event Action<MarketDataSnapshot>? OnMarketUpdate;
+    public event EventHandler<ConnectionStatusEventArgs>? OnConnectionStatusChanged;
+    public event EventHandler? OnReconnect;
 
     #endregion
-
-    /// <summary>
-    /// Event raised when the connection status changes.
-    /// </summary>
-    public event EventHandler<ConnectionStatusEventArgs>? OnConnectionStatusChanged;
 
     private const int HeartbeatIntervalMs = 20_000;
     private const int MessageTimeoutSeconds = HeartbeatIntervalMs * 3;
@@ -49,11 +40,11 @@ public class T4APIClient : IDisposable
     private readonly ILoggerFactory _loggerFactory;
     private readonly ICredentialProvider _credentialProvider;
     private readonly IHttpClientFactory _httpClientFactory;
+    private readonly DatabaseHelper _databaseHelper;
 
     private ClientWebSocket _client;
     private LoginResponse? _loginResponse;
 
-    // Connection tracking
     private readonly AsyncRetryPolicy _connectionPolicy;
     private readonly SemaphoreSlim _reconnectionLock = new(1, 1);
     private DateTime? _connectedSinceUTC;
@@ -68,42 +59,37 @@ public class T4APIClient : IDisposable
     private readonly List<(string ExchangeId, string ContractId, string MarketId)> _marketSubscriptions = new();
     private readonly List<(string ExchangeId, string ContractId, string MarketId)> _mboSubscriptions = new();
 
-    /// <summary>
-    /// Collection of user Accounts (AccountID -> Account).
-    /// </summary>
     private readonly Dictionary<string, Account> _accounts = new();
-
 
     private DateTime _lastMessageReceived = DateTime.MinValue;
 
-
-    // To manage the JWT needed for any REST calls.
-    private AuthenticationToken? _authToken = null;
-    private TaskCompletionSource<AuthenticationToken> _pendingTokenRequest = null;
+    private AuthenticationToken? _authToken;
+    private TaskCompletionSource<AuthenticationToken> _pendingTokenRequest = new();
 
     public T4APIClient(
         ICredentialProvider credentialProvider,
         ILogger<T4APIClient> logger,
         ILoggerFactory loggerFactory,
         IHttpClientFactory httpClientFactory,
-        IConfiguration configuration)
+        IConfiguration configuration,
+        DatabaseHelper databaseHelper)
     {
-        _webSocketUri = new Uri(configuration["T4API:WebSocketUri"] ?? "");
-        _restUri = new Uri(configuration["T4API:RESTUri"] ?? "");
+        _webSocketUri = new Uri(configuration["T4API:WebSocketUri"] ?? throw new ArgumentNullException(nameof(configuration), "WebSocketUri is required"));
+        _restUri = new Uri(configuration["T4API:RESTUri"] ?? throw new ArgumentNullException(nameof(configuration), "RESTUri is required"));
 
-        _credentialProvider = credentialProvider;
+        _credentialProvider = credentialProvider ?? throw new ArgumentNullException(nameof(credentialProvider));
         _client = new ClientWebSocket();
-        _logger = logger;
-        _loggerFactory = loggerFactory;
-        _httpClientFactory = httpClientFactory;
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
+        _httpClientFactory = httpClientFactory ?? throw new ArgumentNullException(nameof(httpClientFactory));
+        _databaseHelper = databaseHelper ?? throw new ArgumentNullException(nameof(databaseHelper));
 
         _heartbeatTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(HeartbeatIntervalMs));
 
         var random = new Random();
 
-        // Connection retry policy. Random jitter and backs off, but tries forever with a 5 second re-try interval.
         _connectionPolicy = Policy
-            .Handle<Exception>(IsRecoverableException) // Only retry on recoverable exceptions
+            .Handle<Exception>(IsRecoverableException)
             .WaitAndRetryForeverAsync(
                 retryAttempt => TimeSpan.FromMilliseconds(
                     Math.Min(5000, Math.Pow(2, retryAttempt) * 100) + random.Next(-500, 500)
@@ -117,27 +103,28 @@ public class T4APIClient : IDisposable
     }
 
     public async void Dispose()
-{
-    _logger.LogInformation("Disposing T4APIClient");
-    _isDisposed = true;
-    _reconnectionLock.Dispose();
-    _heartbeatTimer.Dispose();
-
-    if (_client.State == WebSocketState.Open)
     {
-        try
-        {
-            await _client.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing", CancellationToken.None);
-        }
-        catch (WebSocketException ex)
-        {
-            _logger.LogWarning(ex, "Failed to close WebSocket gracefully during disposal");
-        }
-    }
+        _logger.LogInformation("Disposing T4APIClient");
+        _isDisposed = true;
+        _reconnectionLock.Dispose();
+        _heartbeatTimer.Dispose();
 
-    _client.Dispose();
-    _logger.LogInformation("T4APIClient disposed");
-}
+        if (_client.State == WebSocketState.Open)
+        {
+            try
+            {
+                await _client.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing", CancellationToken.None);
+            }
+            catch (WebSocketException ex)
+            {
+                _logger.LogWarning(ex, "Failed to close WebSocket gracefully during disposal");
+            }
+        }
+
+        _client.Dispose();
+        _pendingTokenRequest = new TaskCompletionSource<AuthenticationToken>();
+        _logger.LogInformation("T4APIClient disposed");
+    }
 
     public async Task StartAsync()
     {
@@ -152,26 +139,25 @@ public class T4APIClient : IDisposable
     }
 
     public async Task<HttpClient> GetHttpClientAsync()
-{
-    var client = _httpClientFactory.CreateClient("T4API");
-    if (_loginResponse != null)
     {
-        var token = await GetAuthToken();
-        if (token != null && !string.IsNullOrEmpty(token.Token)) // Check for non-null token
+        var client = _httpClientFactory.CreateClient("T4API");
+        if (_loginResponse != null)
         {
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+            var token = await GetAuthToken();
+            if (token != null && !string.IsNullOrEmpty(token.Token))
+            {
+                client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token.Token);
+            }
+            else
+            {
+                _logger.LogError("Failed to get auth token for HttpClient");
+            }
         }
-        else
-        {
-            _logger.LogError("Failed to get auth token for HttpClient");
-        }
+        return client;
     }
-    return client;
-}
 
     public async Task<AuthenticationToken?> GetAuthToken()
     {
-        // Check if current token is valid
         var tokenExpireTimeUTC = _authToken?.ExpireTime.ToDateTime() ?? DateTime.MinValue;
         var utcNow = DateTime.UtcNow;
         var remainingSeconds = tokenExpireTimeUTC.Subtract(utcNow).TotalSeconds;
@@ -181,28 +167,21 @@ public class T4APIClient : IDisposable
             return _authToken;
         }
 
-        // Refresh the token
-
-        // If we already have a pending request, wait for it
-        if (_pendingTokenRequest != null)
+        if (_pendingTokenRequest.Task.IsCompleted)
         {
-            return await _pendingTokenRequest.Task;
+            _pendingTokenRequest = new TaskCompletionSource<AuthenticationToken>();
         }
 
         try
         {
-            _pendingTokenRequest = new TaskCompletionSource<AuthenticationToken>();
-
             var tokenRequest = new AuthenticationTokenRequest
             {
                 RequestId = Guid.NewGuid().ToString()
             };
 
-            // Send the request
             await SendMessageAsync(tokenRequest);
             _logger.LogInformation($"Requested Authentication Token from API...");
 
-            // Wait for the response (the response will be handled in HandleMessage and will complete the task)
             var token = await _pendingTokenRequest.Task;
 
             if (string.IsNullOrEmpty(token.Token) || token.FailMessage?.Length > 0)
@@ -214,20 +193,19 @@ public class T4APIClient : IDisposable
                 _logger.LogInformation($"Authentication token response received. Success");
             }
 
-            // Cache the token.
             _authToken = token;
 
             return token;
         }
         finally
         {
-            _pendingTokenRequest = null;
+            _pendingTokenRequest = new TaskCompletionSource<AuthenticationToken>();
         }
     }
 
     #region Markets and Depth Updates
 
-    public string ConnectedUserID => _loginResponse.UserId;
+    public string ConnectedUserID => _loginResponse?.UserId ?? string.Empty;
 
     public MarketDataSnapshot? GetLastSnapshot(string marketID)
     {
@@ -263,17 +241,14 @@ public class T4APIClient : IDisposable
 
     public void Republish()
     {
-        // Republish connection status.
         PublishConnectionStatus(_client.State == WebSocketState.Open);
 
-        // Republish accounts.
         foreach (var acct in _accounts.Values)
         {
             var accountUpdateResult = new Account.AccountUpdateResult(acct, acct.Positions.Values.ToList(), acct.Orders.Values.ToList(), acct.Orders.Values.SelectMany(o => o.Trades.Values).ToList());
             OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
         }
 
-        // Republish market depths.
         foreach (var depth in _marketSnapshots.Values)
         {
             OnMarketUpdate?.Invoke(depth);
@@ -293,7 +268,6 @@ public class T4APIClient : IDisposable
                 _client.Dispose();
                 _client = new ClientWebSocket();
 
-                // Clear existing state.
                 _marketSnapshots.Clear();
                 _accounts.Clear();
             }
@@ -311,25 +285,23 @@ public class T4APIClient : IDisposable
 
         var serverMessage = await ReceiveMessageAsync();
 
-        if (serverMessage.PayloadCase != T4Proto.V1.Service.ServerMessage.PayloadOneofCase.LoginResponse)
+        if (serverMessage?.PayloadCase != ServerMessage.PayloadOneofCase.LoginResponse)
         {
-            throw new AuthenticationException($"Expected auth response, got {serverMessage.PayloadCase}");
+            throw new AuthenticationException($"Expected auth response, got {serverMessage?.PayloadCase}");
         }
 
         var loginResponse = serverMessage.LoginResponse;
-        if (loginResponse.Result != T4Proto.V1.Common.LoginResult.Success)
+        if (loginResponse.Result != LoginResult.Success)
         {
             throw new AuthenticationException($"Authentication failed: {loginResponse.ErrorMessage}");
         }
 
-        // List the exchanges we have access to
         _logger.LogDebug($"User has access to {loginResponse.Exchanges.Count} exchanges:");
         foreach (var exchg in loginResponse.Exchanges)
         {
             _logger.LogDebug($"   Exchange: {exchg.ExchangeId}, Access: {exchg.MarketDataType}");
         }
 
-        // Create accounts for the user.
         _logger.LogInformation($"User has access to {loginResponse.Accounts.Count} accounts:");
         foreach (var acct in loginResponse.Accounts)
         {
@@ -341,59 +313,60 @@ public class T4APIClient : IDisposable
         _lastMessageReceived = DateTime.UtcNow;
         _loginResponse = loginResponse;
 
-        if (_loginResponse.AuthenticationToken != null)
+        if (loginResponse.AuthenticationToken != null)
         {
-            _authToken = _loginResponse.AuthenticationToken;
+            _authToken = loginResponse.AuthenticationToken;
         }
     }
 
     private async Task RunReceiveLoopAsync()
-{
-    bool wasConnected = false;
-    while (!_isDisposed)
     {
-        try
+        bool wasConnected = false;
+        while (!_isDisposed)
         {
-            var isConnected = IsConnectionHealthy();
-
-            if (wasConnected && !isConnected)
+            try
             {
-                _disconnectionCount++;
-                _logger.LogWarning("Connection lost. Total disconnections: {Count}", _disconnectionCount);
-                PublishConnectionStatus(false);
-            }
-            else if (!wasConnected && isConnected)
-            {
-                _logger.LogInformation("Connection restored");
-                await ResubscribeMarketsAsync();
-                await SubscribeAllAccounts(); // Resubscribe accounts
-                PublishConnectionStatus(true);
-            }
+                var isConnected = IsConnectionHealthy();
 
-            wasConnected = isConnected;
+                if (wasConnected && !isConnected)
+                {
+                    _disconnectionCount++;
+                    _logger.LogWarning("Connection lost. Total disconnections: {Count}", _disconnectionCount);
+                    PublishConnectionStatus(false);
+                }
+                else if (!wasConnected && isConnected)
+                {
+                    _logger.LogInformation("Connection restored");
+                    await ResubscribeMarketsAsync();
+                    await SubscribeAllAccounts();
+                    OnReconnect?.Invoke(this, EventArgs.Empty);
+                    PublishConnectionStatus(true);
+                }
 
-            if (!isConnected)
-            {
-                _logger.LogInformation("Attempting reconnection, attempt {Count}", _disconnectionCount + 1);
-                await ConnectAsync();
-                continue;
-            }
+                wasConnected = isConnected;
 
-            var serverMessage = await ReceiveMessageAsync();
-            if (serverMessage == null)
-            {
-                _logger.LogWarning("Null message received, triggering reconnection");
-                continue; // Reconnect
+                if (!isConnected)
+                {
+                    _logger.LogInformation("Attempting reconnection, attempt {Count}", _disconnectionCount + 1);
+                    await ConnectAsync();
+                    continue;
+                }
+
+                var serverMessage = await ReceiveMessageAsync();
+                if (serverMessage == null)
+                {
+                    _logger.LogWarning("Null message received, triggering reconnection");
+                    continue;
+                }
+                ProcessServerMessage(serverMessage);
             }
-            ProcessServerMessage(serverMessage);
-        }
-        catch (Exception ex) when (!_isDisposed)
-        {
-            _logger.LogError(ex, "Error in receive/monitor loop");
-            await Task.Delay(1000); // Prevent tight loop
+            catch (Exception ex) when (!_isDisposed)
+            {
+                _logger.LogError(ex, "Error in receive/monitor loop");
+                await Task.Delay(1000);
+            }
         }
     }
-}
 
     #endregion
 
@@ -401,7 +374,6 @@ public class T4APIClient : IDisposable
 
     public async Task SubscribeMarket(string exchangeId, string contractId, string marketId)
     {
-        // Add to subscribed markets list if not already present
         var marketTuple = (exchangeId, contractId, marketId);
         if (!_marketSubscriptions.Contains(marketTuple))
         {
@@ -413,19 +385,18 @@ public class T4APIClient : IDisposable
             ExchangeId = exchangeId,
             ContractId = contractId,
             MarketId = marketId,
-            Buffer = T4Proto.V1.Common.DepthBuffer.Smart,
-            DepthLevels = T4Proto.V1.Common.DepthLevels.Normal
+            Buffer = DepthBuffer.Smart,
+            DepthLevels = DepthLevels.Normal
         };
 
         await SendMessageAsync(message);
 
         try
         {
-            // Publish empty depth for immediate UI update
             var emptyDepth = new MarketDepth
             {
                 MarketId = marketId,
-                Mode = T4Proto.V1.Common.MarketMode.Undefined,
+                Mode = MarketMode.Undefined,
                 Time = TimeUtil.CSTToProtobufTimestamp(DateTime.Now)
             };
 
@@ -441,7 +412,6 @@ public class T4APIClient : IDisposable
 
     public async Task SubscribeMarketByOrder(string exchangeId, string contractId, string marketId)
     {
-        // Add to subscribed markets list if not already present
         var marketTuple = (exchangeId, contractId, marketId);
         if (!_mboSubscriptions.Contains(marketTuple))
         {
@@ -462,7 +432,6 @@ public class T4APIClient : IDisposable
 
     public async Task UnsubscribeMarketByOrder(string exchangeId, string contractId, string marketId)
     {
-        // Add to subscribed markets list if not already present
         var marketTuple = (exchangeId, contractId, marketId);
         if (_mboSubscriptions.Contains(marketTuple))
         {
@@ -495,7 +464,7 @@ public class T4APIClient : IDisposable
 
     private List<LoginResponse.Types.Account> GetUserTradingAccounts()
     {
-        if (_loginResponse?.Result != T4Proto.V1.Common.LoginResult.Success)
+        if (_loginResponse?.Result != LoginResult.Success)
         {
             return [];
         }
@@ -526,45 +495,45 @@ public class T4APIClient : IDisposable
 
     #region Message Handling
 
-    private async Task<T4Proto.V1.Service.ServerMessage?> ReceiveMessageAsync()
-{
-    try
+    private async Task<ServerMessage?> ReceiveMessageAsync()
     {
-        using var messageStream = new MemoryStream();
-        var buffer = new byte[4096];
-
-        while (!_isDisposed)
+        try
         {
-            var result = await _client.ReceiveAsync(buffer, CancellationToken.None);
+            using var messageStream = new MemoryStream();
+            var buffer = new byte[4096];
 
-            if (result.MessageType == WebSocketMessageType.Close)
+            while (!_isDisposed)
             {
-                _logger.LogWarning("Server closed connection: Status={Status}, Description={Description}", 
-                    result.CloseStatus, result.CloseStatusDescription);
-                return null; // Signal reconnection
-            }
+                var result = await _client.ReceiveAsync(buffer, CancellationToken.None);
 
-            await messageStream.WriteAsync(buffer.AsMemory(0, result.Count));
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    _logger.LogWarning("Server closed connection: Status={Status}, Description={Description}", 
+                        result.CloseStatus, result.CloseStatusDescription);
+                    return null;
+                }
 
-            if (result.EndOfMessage)
-            {
-                var completeMessage = messageStream.ToArray();
-                return T4Proto.V1.Service.ServerMessage.Parser.ParseFrom(completeMessage);
+                await messageStream.WriteAsync(buffer.AsMemory(0, result.Count));
+
+                if (result.EndOfMessage)
+                {
+                    var completeMessage = messageStream.ToArray();
+                    return ServerMessage.Parser.ParseFrom(completeMessage);
+                }
             }
+            return null;
         }
-        return null; // Disposed
+        catch (WebSocketException ex)
+        {
+            _logger.LogWarning(ex, "WebSocket error in ReceiveMessageAsync: {Message}", ex.Message);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error in ReceiveMessageAsync");
+            throw;
+        }
     }
-    catch (WebSocketException ex)
-    {
-        _logger.LogWarning(ex, "WebSocket error in ReceiveMessageAsync: {Message}", ex.Message);
-        return null; // Trigger reconnection
-    }
-    catch (Exception ex)
-    {
-        _logger.LogError(ex, "Unexpected error in ReceiveMessageAsync");
-        throw; // Rethrow non-WebSocket errors
-    }
-}
 
     public async Task SendMessageAsync(IMessage message, ClientWebSocket? client = null)
     {
@@ -584,22 +553,19 @@ public class T4APIClient : IDisposable
         await client.SendAsync(outgoingMessage.ToByteArray(), WebSocketMessageType.Binary, true, CancellationToken.None);
     }
 
-    private void ProcessServerMessage(T4Proto.V1.Service.ServerMessage serverMessage)
+    private void ProcessServerMessage(ServerMessage serverMessage)
     {
-        _lastMessageReceived = DateTime.UtcNow;  // Any message from server resets our timeout
+        _lastMessageReceived = DateTime.UtcNow;
 
         switch (serverMessage.PayloadCase)
         {
-            case T4Proto.V1.Service.ServerMessage.PayloadOneofCase.Heartbeat:
-                // _lastMessageReceived was updated above, nothing left to process.
+            case ServerMessage.PayloadOneofCase.Heartbeat:
                 _logger.LogDebug("Received heartbeat with timestamp: {Timestamp}", serverMessage.Heartbeat.Timestamp);
                 break;
 
             case ServerMessage.PayloadOneofCase.MarketDepthSubscribeReject:
-                {
-                    _logger.LogInformation($"Market depth subscription rejected: {serverMessage.MarketDepthSubscribeReject.MarketId} ({serverMessage.MarketDepthSubscribeReject.Mode})");
-                    break;
-                }
+                _logger.LogInformation($"Market depth subscription rejected: {serverMessage.MarketDepthSubscribeReject.MarketId} ({serverMessage.MarketDepthSubscribeReject.Mode})");
+                break;
 
             case ServerMessage.PayloadOneofCase.MarketDepth:
                 ProcessMarketDepth(serverMessage.MarketDepth);
@@ -618,104 +584,244 @@ public class T4APIClient : IDisposable
                 break;
 
             case ServerMessage.PayloadOneofCase.MarketSnapshot:
+                _logger.LogInformation($"Received market snapshot: {serverMessage.MarketSnapshot.MarketId}");
+                foreach (var snapshotMessage in serverMessage.MarketSnapshot.Messages)
                 {
-                    _logger.LogInformation($"Received market snapshot: {serverMessage.MarketSnapshot.MarketId}");
-                    foreach (var snapshotMessage in serverMessage.MarketSnapshot.Messages)
+                    switch (snapshotMessage.PayloadCase)
                     {
-                        switch (snapshotMessage.PayloadCase)
-                        {
-                            case MarketSnapshotMessage.PayloadOneofCase.MarketDepth:
-                                ProcessMarketDepth(snapshotMessage.MarketDepth);
-                                break;
-                        }
+                        case MarketSnapshotMessage.PayloadOneofCase.MarketDepth:
+                            ProcessMarketDepth(snapshotMessage.MarketDepth);
+                            break;
                     }
-                    break;
                 }
+                break;
 
             case ServerMessage.PayloadOneofCase.MarketDetails:
                 ProcessMarketDetails(serverMessage.MarketDetails);
                 break;
 
             case ServerMessage.PayloadOneofCase.AccountSubscribeResponse:
-                {
-                    _logger.LogInformation($"Received account subscribe response. Success: {serverMessage.AccountSubscribeResponse.Success}");
-                    serverMessage.AccountSubscribeResponse.Errors.ToList().ForEach(e => _logger.LogWarning(" * " + e));
-                    break;
-                }
+                _logger.LogInformation($"Received account subscribe response. Success: {serverMessage.AccountSubscribeResponse.Success}");
+                serverMessage.AccountSubscribeResponse.Errors.ToList().ForEach(e => _logger.LogWarning(" * " + e));
+                break;
 
             case ServerMessage.PayloadOneofCase.AccountDetails:
+                if (_accounts.TryGetValue(serverMessage.AccountDetails.AccountId, out var account))
                 {
-                    if (_accounts.TryGetValue(serverMessage.AccountDetails.AccountId, out var account))
-                    {
-                        var accountUpdateResult = account.UpdateWithMessage(serverMessage);
-                        OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
-                        _logger.LogInformation("Received account details: {AccountId}", serverMessage.AccountDetails.AccountId);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Received account details for unknown account: {AccountId}", serverMessage.AccountDetails.AccountId);
-                    }
+                    var accountUpdateResult = account.UpdateWithMessage(serverMessage);
+                    OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
+                    _logger.LogInformation("Received account details: {AccountId}", serverMessage.AccountDetails.AccountId);
+                }
+                else
+                {
+                    _logger.LogWarning("Received account details for unknown account: {AccountId}", serverMessage.AccountDetails.AccountId);
                 }
                 break;
 
             case ServerMessage.PayloadOneofCase.AccountUpdate:
+                if (_accounts.TryGetValue(serverMessage.AccountUpdate.AccountId, out var accountUpdate))
                 {
-                    if (_accounts.TryGetValue(serverMessage.AccountUpdate.AccountId, out var account))
-                    {
-                        var accountUpdateResult = account.UpdateWithMessage(serverMessage);
-                        OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
-                        _logger.LogInformation("Received account update: {AccountId}", serverMessage.AccountUpdate.AccountId);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Received account update for unknown account: {AccountId}", serverMessage.AccountUpdate.AccountId);
-                    }
+                    var accountUpdateResult = accountUpdate.UpdateWithMessage(serverMessage);
+                    OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
+                    _logger.LogInformation("Received account update: {AccountId}", serverMessage.AccountUpdate.AccountId);
+                }
+                else
+                {
+                    _logger.LogWarning("Received account update for unknown account: {AccountId}", serverMessage.AccountUpdate.AccountId);
                 }
                 break;
 
             case ServerMessage.PayloadOneofCase.AccountPosition:
+                if (_accounts.TryGetValue(serverMessage.AccountPosition.AccountId, out var accountPosition))
                 {
-                    if (_accounts.TryGetValue(serverMessage.AccountPosition.AccountId, out var account))
-                    {
-                        var accountUpdateResult = account.UpdateWithMessage(serverMessage);
-                        OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
-
-                        _logger.LogInformation("Received account position: {AccountId}/{MarketID}", serverMessage.AccountPosition.AccountId, serverMessage.AccountPosition.MarketId);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Received account position for unknown account: {AccoAccountIduntName}, Market: {MarketID}", serverMessage.AccountPosition.AccountId, serverMessage.AccountPosition.MarketId);
-                    }
+                    var accountUpdateResult = accountPosition.UpdateWithMessage(serverMessage);
+                    OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
+                    _logger.LogInformation("Received account position: {AccountId}/{MarketID}", serverMessage.AccountPosition.AccountId, serverMessage.AccountPosition.MarketId);
+                }
+                else
+                {
+                    _logger.LogWarning("Received account position for unknown account: {AccountId}, Market: {MarketID}", serverMessage.AccountPosition.AccountId, serverMessage.AccountPosition.MarketId);
                 }
                 break;
 
             case ServerMessage.PayloadOneofCase.AccountSnapshot:
+                if (_accounts.TryGetValue(serverMessage.AccountSnapshot.AccountId, out var accountSnapshot))
                 {
-                    if (_accounts.TryGetValue(serverMessage.AccountSnapshot.AccountId, out var account))
+                    var filteredSnapshot = new AccountSnapshot
                     {
-                        var accountUpdateResult = account.UpdateWithMessage(serverMessage);
+                        AccountId = serverMessage.AccountSnapshot.AccountId,
+                        LastUpdateRequested = serverMessage.AccountSnapshot.LastUpdateRequested,
+                        LastUpdateSupplied = serverMessage.AccountSnapshot.LastUpdateSupplied,
+                        Status = serverMessage.AccountSnapshot.Status,
+                        DueToConnection = serverMessage.AccountSnapshot.DueToConnection
+                    };
+
+                    int totalOrders = 0;
+                    int processedOrders = 0;
+
+                    foreach (var message in serverMessage.AccountSnapshot.Messages)
+                    {
+                        if (message.PayloadCase == AccountSnapshotMessage.PayloadOneofCase.OrderUpdateMulti)
+                        {
+                            var filteredOrderMulti = new OrderUpdateMulti
+                            {
+                                MarketId = message.OrderUpdateMulti.MarketId,
+                                AccountId = message.OrderUpdateMulti.AccountId,
+                                Historical = message.OrderUpdateMulti.Historical
+                            };
+
+                            totalOrders += message.OrderUpdateMulti.Updates.Count;
+
+                            foreach (var update in message.OrderUpdateMulti.Updates)
+                            {
+                                string uniqueId = GetUniqueIdFromUpdate(update);
+                                if (string.IsNullOrEmpty(uniqueId))
+                                {
+                                    _logger.LogWarning("Skipping order update with empty UniqueId in snapshot");
+                                    continue;
+                                }
+
+                                bool hasTrades = false;
+                                string payloadType = update.PayloadCase.ToString();
+
+                                // Process all orders with TotalFillVolume > 0 or Trades
+                                if (update.PayloadCase == OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdate)
+                                {
+                                    if (update.OrderUpdate?.TotalFillVolume > 0 || update.OrderUpdate?.Trades.Any() == true)
+                                    {
+                                        hasTrades = update.OrderUpdate.Trades.Any();
+                                        bool allFillsProcessed = hasTrades && update.OrderUpdate.Trades.All(t => _databaseHelper.IsFillProcessed(uniqueId, t.SequenceOrder));
+                                        if (allFillsProcessed)
+                                        {
+                                            _logger.LogDebug("Skipping fully processed order with fills: UniqueId={UniqueId}, Status={Status}, Payload={Payload}, TotalFillVolume={TotalFillVolume}", 
+                                                uniqueId, update.OrderUpdate.Status, payloadType, update.OrderUpdate.TotalFillVolume);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                else if (update.PayloadCase == OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateTrade)
+                                {
+                                    hasTrades = true;
+                                    if (_databaseHelper.IsFillProcessed(uniqueId, update.OrderUpdateTrade.SequenceOrder))
+                                    {
+                                        _logger.LogDebug("Skipping fully processed trade order: UniqueId={UniqueId}, SequenceOrder={SequenceOrder}, Payload={Payload}", 
+                                            uniqueId, update.OrderUpdateTrade.SequenceOrder, payloadType);
+                                        continue;
+                                    }
+                                }
+
+                                filteredOrderMulti.Updates.Add(update);
+                                processedOrders++;
+                                _logger.LogDebug("Processing order in snapshot: UniqueId={UniqueId}, Status={Status}, HasTrades={HasTrades}, Payload={Payload}, TotalFillVolume={TotalFillVolume}", 
+                                    uniqueId, update.OrderUpdate?.Status.ToString() ?? "Unknown", hasTrades, payloadType, 
+                                    update.OrderUpdate?.TotalFillVolume ?? 0);
+                            }
+
+                            if (filteredOrderMulti.Updates.Any())
+                            {
+                                filteredSnapshot.Messages.Add(new AccountSnapshotMessage { OrderUpdateMulti = filteredOrderMulti });
+                            }
+                        }
+                        else
+                        {
+                            filteredSnapshot.Messages.Add(message);
+                        }
+                    }
+
+                    _logger.LogInformation("AccountSnapshot processed: TotalOrders={Total}, ProcessedOrders={Processed}, AccountId={AccountId}",
+                        totalOrders, processedOrders, serverMessage.AccountSnapshot.AccountId);
+
+                    if (filteredSnapshot.Messages.Any())
+                    {
+                        var accountUpdateResult = accountSnapshot.UpdateWithMessage(new ServerMessage { AccountSnapshot = filteredSnapshot });
                         OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
                         _logger.LogInformation("Received account snapshot: {AccountId}", serverMessage.AccountSnapshot.AccountId);
                     }
                     else
                     {
-                        _logger.LogWarning("Received account snapshot for unknown account: {AccountId}", serverMessage.AccountSnapshot.AccountId);
+                        _logger.LogDebug("No unprocessed messages in AccountSnapshot for account: {AccountId}", serverMessage.AccountSnapshot.AccountId);
                     }
+                }
+                else
+                {
+                    _logger.LogWarning("Received account snapshot for unknown account: {AccountId}", serverMessage.AccountSnapshot.AccountId);
                 }
                 break;
 
             case ServerMessage.PayloadOneofCase.OrderUpdateMulti:
+                if (_accounts.TryGetValue(serverMessage.OrderUpdateMulti.AccountId, out var accountOrderMulti))
                 {
-                    if (_accounts.TryGetValue(serverMessage.OrderUpdateMulti.AccountId, out var account))
+                    var filteredUpdates = new OrderUpdateMulti
                     {
-                        var accountUpdateResult = account.UpdateWithMessage(serverMessage);
+                        MarketId = serverMessage.OrderUpdateMulti.MarketId,
+                        AccountId = serverMessage.OrderUpdateMulti.AccountId,
+                        Historical = serverMessage.OrderUpdateMulti.Historical
+                    };
+
+                    int totalOrders = serverMessage.OrderUpdateMulti.Updates.Count;
+                    int processedOrders = 0;
+
+                    foreach (var update in serverMessage.OrderUpdateMulti.Updates)
+                    {
+                        string uniqueId = GetUniqueIdFromUpdate(update);
+                        if (string.IsNullOrEmpty(uniqueId))
+                        {
+                            _logger.LogWarning("Skipping order update with empty UniqueId");
+                            continue;
+                        }
+
+                        bool hasTrades = false;
+                        string payloadType = update.PayloadCase.ToString();
+
+                        if (update.PayloadCase == OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdate)
+                        {
+                            if (update.OrderUpdate?.TotalFillVolume > 0 || update.OrderUpdate?.Trades.Any() == true)
+                            {
+                                hasTrades = update.OrderUpdate.Trades.Any();
+                                bool allFillsProcessed = hasTrades && update.OrderUpdate.Trades.All(t => _databaseHelper.IsFillProcessed(uniqueId, t.SequenceOrder));
+                                if (allFillsProcessed)
+                                {
+                                    _logger.LogDebug("Skipping fully processed order with fills: UniqueId={UniqueId}, Status={Status}, Payload={Payload}, TotalFillVolume={TotalFillVolume}", 
+                                        uniqueId, update.OrderUpdate.Status, payloadType, update.OrderUpdate.TotalFillVolume);
+                                    continue;
+                                }
+                            }
+                        }
+                        else if (update.PayloadCase == OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateTrade)
+                        {
+                            hasTrades = true;
+                            if (_databaseHelper.IsFillProcessed(uniqueId, update.OrderUpdateTrade.SequenceOrder))
+                            {
+                                _logger.LogDebug("Skipping fully processed trade order: UniqueId={UniqueId}, SequenceOrder={SequenceOrder}, Payload={Payload}", 
+                                    uniqueId, update.OrderUpdateTrade.SequenceOrder, payloadType);
+                                continue;
+                            }
+                        }
+
+                        filteredUpdates.Updates.Add(update);
+                        processedOrders++;
+                        _logger.LogDebug("Processing order update: UniqueId={UniqueId}, Status={Status}, HasTrades={HasTrades}, Payload={Payload}, TotalFillVolume={TotalFillVolume}", 
+                            uniqueId, update.OrderUpdate?.Status.ToString() ?? "Unknown", hasTrades, payloadType, 
+                            update.OrderUpdate?.TotalFillVolume ?? 0);
+                    }
+
+                    _logger.LogInformation("OrderUpdateMulti processed: TotalOrders={Total}, ProcessedOrders={Processed}, AccountId={AccountId}",
+                        totalOrders, processedOrders, serverMessage.OrderUpdateMulti.AccountId);
+
+                    if (filteredUpdates.Updates.Any())
+                    {
+                        var accountUpdateResult = accountOrderMulti.UpdateWithMessage(new ServerMessage { OrderUpdateMulti = filteredUpdates });
                         OnAccountUpdate?.Invoke(this, new AccountUpdateEventArgs(accountUpdateResult));
                         _logger.LogInformation("Received order update multi: {AccountId}", serverMessage.OrderUpdateMulti.AccountId);
                     }
                     else
                     {
-                        _logger.LogWarning("Received order update multi for unknown account: {AccountId}", serverMessage.OrderUpdateMulti.AccountId);
+                        _logger.LogDebug("No unprocessed orders in OrderUpdateMulti for account: {AccountId}", serverMessage.OrderUpdateMulti.AccountId);
                     }
+                }
+                else
+                {
+                    _logger.LogWarning("Received order update multi for unknown account: {AccountId}", serverMessage.OrderUpdateMulti.AccountId);
                 }
                 break;
 
@@ -728,23 +834,46 @@ public class T4APIClient : IDisposable
                 break;
 
             case ServerMessage.PayloadOneofCase.AuthenticationToken:
+                _authToken = serverMessage.AuthenticationToken;
+
+                if (!_pendingTokenRequest.Task.IsCompleted)
                 {
-                    _authToken = serverMessage.AuthenticationToken;
-
-                    // Complete the pending token request if any
-                    if (_pendingTokenRequest != null && !_pendingTokenRequest.Task.IsCompleted)
-                    {
-                        _pendingTokenRequest.SetResult(_authToken);
-                    }
-
-                    _logger.LogInformation("Received authentication token. Expires at: {ExpireTime} CST", _authToken.ExpireTime.ProtobufTimestampToCST());
-                    break;
+                    _pendingTokenRequest.SetResult(_authToken);
                 }
+
+                _logger.LogInformation("Received authentication token. Expires at: {ExpireTime} CST", _authToken?.ExpireTime.ProtobufTimestampToCST());
+                break;
 
             default:
                 _logger.LogInformation($"! Unhandled Server Message: {serverMessage.PayloadCase}");
                 break;
         }
+    }
+
+    private string GetUniqueIdFromUpdate(OrderUpdateMultiMessage update)
+    {
+        return update.PayloadCase switch
+        {
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdate => update.OrderUpdate.UniqueId,
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateStatus => update.OrderUpdateStatus.UniqueId,
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateTrade => update.OrderUpdateTrade.UniqueId,
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateTradeLeg => update.OrderUpdateTradeLeg.UniqueId,
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateFailed => update.OrderUpdateFailed.UniqueId,
+            _ => string.Empty
+        };
+    }
+
+    private bool IsOrderFinished(OrderUpdateMultiMessage update)
+    {
+        return update.PayloadCase switch
+        {
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdate => update.OrderUpdate.Status == OrderStatus.Finished,
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateStatus => update.OrderUpdateStatus.Status == OrderStatus.Finished,
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateTrade => update.OrderUpdateTrade.Status == OrderStatus.Finished,
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateTradeLeg => update.OrderUpdateTradeLeg.Status == OrderStatus.Finished,
+            OrderUpdateMultiMessage.PayloadOneofCase.OrderUpdateFailed => false,
+            _ => false
+        };
     }
 
     private void ProcessMarketByOrderSubscribeReject(MarketByOrderSubscribeReject marketByOrderSubscribeReject)
@@ -766,7 +895,6 @@ public class T4APIClient : IDisposable
     {
         _logger.LogInformation($"Received market by order snapshot: {marketByOrderSnapshot.MarketId}");
 
-        // Create a MarketByOrder and process the snapshot
         var marketByOrder = new MarketByOrder().ProcessSnapshot(marketByOrderSnapshot);
 
         var updatedSnapshot = _marketSnapshots.AddOrUpdate(
@@ -785,7 +913,6 @@ public class T4APIClient : IDisposable
         {
             if (existingSnapshot.MarketByOrder != null)
             {
-                // Process the update with the existing market by order data
                 var updatedMarketByOrder = existingSnapshot.MarketByOrder.ProcessUpdate(marketByOrderUpdate);
 
                 var updatedSnapshot = existingSnapshot with { MarketByOrder = updatedMarketByOrder };
@@ -834,8 +961,6 @@ public class T4APIClient : IDisposable
         OnMarketUpdate?.Invoke(updatedSnapshot);
     }
 
-    #endregion
-
     #region Heartbeat Handling
 
     private async Task HeartbeatLoopAsync()
@@ -869,7 +994,7 @@ public class T4APIClient : IDisposable
             return;
         }
 
-        var heartbeat = new T4Proto.V1.Service.Heartbeat
+        var heartbeat = new Heartbeat
         {
             Timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
         };
@@ -879,24 +1004,24 @@ public class T4APIClient : IDisposable
     }
 
     private bool IsConnectionHealthy()
-{
-    _logger.LogDebug("Checking WebSocket state: {State}", _client.State);
-    if (_client.State != WebSocketState.Open)
     {
-        _logger.LogWarning("Connection unhealthy: WebSocket state is {State}", _client.State);
-        return false;
+        _logger.LogDebug("Checking WebSocket state: {State}", _client.State);
+        if (_client.State != WebSocketState.Open)
+        {
+            _logger.LogWarning("Connection unhealthy: WebSocket state is {State}", _client.State);
+            return false;
+        }
+
+        var timeSinceLastMessage = DateTime.UtcNow - _lastMessageReceived;
+        var isHealthy = timeSinceLastMessage.TotalSeconds <= MessageTimeoutSeconds;
+
+        if (!isHealthy)
+        {
+            _logger.LogWarning("Connection unhealthy: No messages received for {Seconds} seconds", timeSinceLastMessage.TotalSeconds);
+        }
+
+        return isHealthy;
     }
-
-    var timeSinceLastMessage = DateTime.UtcNow - _lastMessageReceived;
-    var isHealthy = timeSinceLastMessage.TotalSeconds <= MessageTimeoutSeconds;
-
-    if (!isHealthy)
-    {
-        _logger.LogWarning("Connection unhealthy: No messages received for {Seconds} seconds", timeSinceLastMessage.TotalSeconds);
-    }
-
-    return isHealthy;
-}
 
     #endregion
 
@@ -904,13 +1029,10 @@ public class T4APIClient : IDisposable
 
     private bool IsRecoverableException(Exception ex)
     {
-        // Examples of recoverable exceptions
         return ex is SocketException ||
                ex is TimeoutException ||
                ex is TaskCanceledException ||
                (ex is HttpRequestException hrex && IsTransientStatusCode(hrex)) ||
-               // Add other recoverable exception types
-               // But exclude exceptions that indicate unrecoverable situations
                !(ex is AuthenticationException ||
                  ex is UnauthorizedAccessException ||
                  ex is InvalidOperationException);
@@ -918,15 +1040,15 @@ public class T4APIClient : IDisposable
 
     private bool IsTransientStatusCode(HttpRequestException ex)
     {
-        // If the exception has a status code
         if (ex.StatusCode.HasValue)
         {
             int code = (int)ex.StatusCode.Value;
-            // Typically 5xx (server errors) and some 4xx codes are transient
             return code >= 500 || code == 408 || code == 429;
         }
-        return true; // If no status code, assume it might be transient
+        return true;
     }
 
     #endregion
 }
+
+#endregion

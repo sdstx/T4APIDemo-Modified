@@ -15,9 +15,18 @@ builder.ConfigureServices((hostContext, services) =>
     {
         return new ConfigurationCredentialProvider(hostContext.Configuration);
     });
-    services.AddSingleton<T4APIClient>();
     services.AddSingleton<DatabaseHelper>(sp => 
         new DatabaseHelper("trades.db", sp.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseHelper>()));
+    services.AddSingleton<T4APIClient>(sp =>
+    {
+        var config = hostContext.Configuration;
+        var credentialProvider = sp.GetRequiredService<ICredentialProvider>();
+        var logger = sp.GetRequiredService<ILogger<T4APIClient>>();
+        var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+        var httpClientFactory = sp.GetRequiredService<IHttpClientFactory>();
+        var databaseHelper = sp.GetRequiredService<DatabaseHelper>();
+        return new T4APIClient(credentialProvider, logger, loggerFactory, httpClientFactory, config, databaseHelper);
+    });
     services.AddHostedService<DemoClient>();
 });
 

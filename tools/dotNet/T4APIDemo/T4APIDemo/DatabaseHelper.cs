@@ -52,19 +52,23 @@ public class DatabaseHelper
                 SellPrice INTEGER,
                 BuyTime TEXT,
                 SellTime TEXT,
-                ProfitLoss REAL,
                 TradeDate INTEGER,
                 FOREIGN KEY (BuyOrderId) REFERENCES Orders(OrderUniqueId),
-                FOREIGN KEY (SellOrderId) REFERENCES Orders(OrderUniqueId),
-                UNIQUE(BuyOrderId, SellOrderId)
+                FOREIGN KEY (SellOrderId) REFERENCES Orders(OrderUniqueId)
+            );
+
+            CREATE TABLE IF NOT EXISTS ProcessedTrades (
+                OrderUniqueId TEXT,
+                SequenceOrder INTEGER,
+                PRIMARY KEY (OrderUniqueId, SequenceOrder)
             );";
 
         command.ExecuteNonQuery();
-        _logger?.LogInformation("Orders and Trades tables initialized.");
+        _logger?.LogInformation("Orders, Trades, and ProcessedTrades tables initialized.");
     }
 
-    public void InsertOrUpdateOrder(string orderUniqueId, string symbol, string status, string buySell,
-        int currentVolume, long price, int totalFillVolume, string timestamp, string statusDetail, string change)
+    public void InsertOrUpdateOrder(string orderId, string symbol, string status, string buySell,
+        int volume, long price, int totalFillVolume, string timestamp, string statusDetail, string change)
     {
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
@@ -72,12 +76,12 @@ public class DatabaseHelper
         var command = connection.CreateCommand();
         command.CommandText = @"
             INSERT OR REPLACE INTO Orders (OrderUniqueId, Symbol, Status, BuySell, CurrentVolume, Price, TotalFillVolume, Timestamp, StatusDetail, Change)
-            VALUES ($orderUniqueId, $symbol, $status, $buySell, $currentVolume, $price, $totalFillVolume, $timestamp, $statusDetail, $change)";
-        command.Parameters.AddWithValue("$orderUniqueId", orderUniqueId);
+            VALUES ($orderId, $symbol, $status, $buySell, $volume, $price, $totalFillVolume, $timestamp, $statusDetail, $change)";
+        command.Parameters.AddWithValue("$orderId", orderId);
         command.Parameters.AddWithValue("$symbol", symbol);
         command.Parameters.AddWithValue("$status", status);
         command.Parameters.AddWithValue("$buySell", buySell);
-        command.Parameters.AddWithValue("$currentVolume", currentVolume);
+        command.Parameters.AddWithValue("$volume", volume);
         command.Parameters.AddWithValue("$price", price);
         command.Parameters.AddWithValue("$totalFillVolume", totalFillVolume);
         command.Parameters.AddWithValue("$timestamp", timestamp);
@@ -85,7 +89,7 @@ public class DatabaseHelper
         command.Parameters.AddWithValue("$change", change ?? (object)DBNull.Value);
 
         command.ExecuteNonQuery();
-        _logger?.LogInformation("Inserted/Updated order: {OrderUniqueId}", orderUniqueId);
+        _logger?.LogInformation("Inserted/Updated order: {OrderId}", orderId);
     }
 
     public void InsertOrUpdateTrades(List<(string buyOrderId, string sellOrderId, string symbol, int volume,
@@ -102,8 +106,8 @@ public class DatabaseHelper
                 var command = connection.CreateCommand();
                 command.Transaction = transaction;
                 command.CommandText = @"
-                    INSERT OR IGNORE INTO Trades (BuyOrderId, SellOrderId, Symbol, Volume, BuyPrice, SellPrice, BuyTime, SellTime, ProfitLoss, TradeDate)
-                    VALUES ($buyOrderId, $sellOrderId, $symbol, $volume, $buyPrice, $sellPrice, $buyTime, $sellTime, $profitLoss, $tradeDate)";
+                    INSERT INTO Trades (BuyOrderId, SellOrderId, Symbol, Volume, BuyPrice, SellPrice, BuyTime, SellTime, TradeDate)
+                    VALUES ($buyOrderId, $sellOrderId, $symbol, $volume, $buyPrice, $sellPrice, $buyTime, $sellTime, $tradeDate)";
                 command.Parameters.AddWithValue("$buyOrderId", trade.buyOrderId);
                 command.Parameters.AddWithValue("$sellOrderId", trade.sellOrderId);
                 command.Parameters.AddWithValue("$symbol", trade.symbol);
@@ -112,28 +116,48 @@ public class DatabaseHelper
                 command.Parameters.AddWithValue("$sellPrice", trade.sellPrice);
                 command.Parameters.AddWithValue("$buyTime", trade.buyTime);
                 command.Parameters.AddWithValue("$sellTime", trade.sellTime);
-                command.Parameters.AddWithValue("$profitLoss", 0.0); // P&L ignored
                 command.Parameters.AddWithValue("$tradeDate", trade.tradeDate);
 
                 command.ExecuteNonQuery();
-                _logger?.LogInformation("Inserted/Updated trade: BuyOrderId={BuyOrderId}, SellOrderId={SellOrderId}", trade.buyOrderId, trade.sellOrderId);
+                _logger?.LogInformation("Inserted trade: BuyOrderId={BuyOrderId}, SellOrderId={SellOrderId}, Volume={Volume}", trade.buyOrderId, trade.sellOrderId, trade.volume);
             }
             transaction.Commit();
         }
         catch (SqliteException ex)
         {
             transaction.Rollback();
-            _logger?.LogError(ex, "Failed to insert/update trades batch");
+            _logger?.LogError(ex, "Failed to insert trades batch");
             throw;
         }
     }
+
+    public bool IsFillProcessed(string orderId, int sequenceOrder)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(1) FROM ProcessedTrades WHERE OrderUniqueId = $orderId AND SequenceOrder = $sequenceOrder";
+        command.Parameters.AddWithValue("$orderId", orderId);
+        command.Parameters.AddWithValue("$sequenceOrder", sequenceOrder);
+
+        return Convert.ToInt32(command.ExecuteScalar()) > 0;
+    }
+
+    public void MarkFillProcessed(string orderId, int sequenceOrder)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+
+        var command = connection.CreateCommand();
+        command.CommandText = "INSERT OR IGNORE INTO ProcessedTrades (OrderUniqueId, SequenceOrder) VALUES ($orderId, $sequenceOrder)";
+        command.Parameters.AddWithValue("$orderId", orderId);
+        command.Parameters.AddWithValue("$sequenceOrder", sequenceOrder);
+
+        command.ExecuteNonQuery();
+        _logger?.LogDebug("Marked fill as processed: OrderId={OrderId}, SequenceOrder={SequenceOrder}", orderId, sequenceOrder);
+    }
 }
-
-
-
-
-
-
 
 
 
